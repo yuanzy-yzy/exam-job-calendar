@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+*.log
+
+# Local calendar data and backups
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+backups/
+settings.json
+calendar.log
+
+# Recruitment collection run outputs (public source snapshots, not application source)
+recruitment_updates_*.json
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
