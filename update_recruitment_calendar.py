@@ -14,6 +14,16 @@ MARKER = "[自动采集-央国企]"
 REMINDER_OFFSETS = [10080, 4320, 1440, 120]
 
 
+def data_directory() -> Path:
+    configured = os.environ.get("EXAM_JOB_CALENDAR_DATA_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    e_drive = Path("E:/")
+    if sys.platform == "win32" and e_drive.exists():
+        return e_drive / "公考求职日历数据"
+    return Path(os.environ.get("APPDATA", str(Path.home()))) / "ExamJobCalendar"
+
+
 def to_dt(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%d %H:%M")
 
@@ -32,8 +42,7 @@ def run() -> int:
 
     payload_path = Path(sys.argv[1])
     items = json.loads(payload_path.read_text(encoding="utf-8"))
-    appdata = Path(os.environ["APPDATA"])
-    app_dir = appdata / "ExamJobCalendar"
+    app_dir = data_directory()
     db_path = app_dir / "calendar.db"
     if not db_path.exists():
         raise FileNotFoundError(f"calendar database not found: {db_path}")

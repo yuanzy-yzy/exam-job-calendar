@@ -4,6 +4,7 @@ import csv
 import ctypes
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -20,7 +21,7 @@ try:
         QApplication, QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDateTimeEdit,
         QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox,
         QHBoxLayout, QHeaderView, QLabel, QLayout, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-        QMenu, QMessageBox, QPushButton, QScrollArea, QSizeGrip, QSpinBox, QSplitter, QStackedWidget,
+        QMenu, QMessageBox, QPushButton, QScrollArea, QSizeGrip, QSizePolicy, QSpinBox, QSplitter, QStackedWidget,
         QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QToolButton,
         QVBoxLayout, QWidget
     )
@@ -32,7 +33,7 @@ except ImportError:
         QApplication, QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDateTimeEdit,
         QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox,
         QHBoxLayout, QHeaderView, QLabel, QLayout, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-        QMenu, QMessageBox, QPushButton, QScrollArea, QSizeGrip, QSpinBox, QSplitter, QStackedWidget,
+        QMenu, QMessageBox, QPushButton, QScrollArea, QSizeGrip, QSizePolicy, QSpinBox, QSplitter, QStackedWidget,
         QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QToolButton,
         QVBoxLayout, QWidget
     )
@@ -40,7 +41,20 @@ except ImportError:
 
 
 APP_NAME = "公考与求职截止日历"
-APP_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "ExamJobCalendar"
+LEGACY_APP_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "ExamJobCalendar"
+
+
+def default_app_dir() -> Path:
+    configured = os.environ.get("EXAM_JOB_CALENDAR_DATA_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    e_drive = Path("E:/")
+    if sys.platform == "win32" and e_drive.exists():
+        return e_drive / "公考求职日历数据"
+    return LEGACY_APP_DIR
+
+
+APP_DIR = default_app_dir()
 DB_PATH = APP_DIR / "calendar.db"
 SETTINGS_PATH = APP_DIR / "settings.json"
 BACKUP_DIR = APP_DIR / "backups"
@@ -66,12 +80,43 @@ DEFAULT_SETTINGS = {
     "overdue_remind": True,
     "last_backup": "",
     "widget_geometry": "",
+    "main_splitter_sizes": [180, 900, 340],
 }
 
 
+_DATA_DIR_READY = False
+
+
 def ensure_dirs() -> None:
+    global _DATA_DIR_READY
     APP_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    if _DATA_DIR_READY or APP_DIR == LEGACY_APP_DIR or not LEGACY_APP_DIR.exists():
+        _DATA_DIR_READY = True
+        return
+    try:
+        legacy_db = LEGACY_APP_DIR / "calendar.db"
+        if legacy_db.exists() and not DB_PATH.exists():
+            source = sqlite3.connect(legacy_db)
+            target = sqlite3.connect(DB_PATH)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+        for name in ("settings.json", "calendar.log"):
+            source_file = LEGACY_APP_DIR / name
+            target_file = APP_DIR / name
+            if source_file.exists() and not target_file.exists():
+                shutil.copy2(source_file, target_file)
+        legacy_backups = LEGACY_APP_DIR / "backups"
+        if legacy_backups.exists():
+            for source_file in legacy_backups.glob("*.db"):
+                target_file = BACKUP_DIR / source_file.name
+                if not target_file.exists():
+                    shutil.copy2(source_file, target_file)
+    finally:
+        _DATA_DIR_READY = True
 
 
 def log_error(exc: BaseException) -> None:
@@ -139,6 +184,150 @@ def event_due(event: dict[str, Any]) -> datetime | None:
 def is_overdue(event: dict[str, Any]) -> bool:
     due = event_due(event)
     return bool(due and due < datetime.now() and event.get("status") not in ("已完成", "已取消"))
+
+
+DATE_TOKEN = r"(?:(?:20\d{2})年)?(?:1[0-2]|0?[1-9])月(?:3[01]|[12]\d|0?[1-9])日(?:\s*(?:[01]?\d|2[0-3])\s*(?:(?::|时|点)\s*(?:[0-5]?\d)?\s*分?)?)?"
+
+
+def normalize_chinese_text(text: str) -> str:
+    return (text or "").replace("∶", ":").replace("：", ":").replace("—", "-").replace("－", "-").replace("﹒", "。")
+
+
+def parse_chinese_datetime(token: str, default_year: int, deadline: bool = False) -> tuple[datetime | None, bool]:
+    token = normalize_chinese_text(token).strip()
+    match = re.search(
+        r"(?:(20\d{2})年)?(\d{1,2})月(\d{1,2})日(?:\s*(\d{1,2})\s*(?:(?::|时|点)\s*(\d{1,2})?\s*分?)?)?",
+        token,
+    )
+    if not match:
+        return None, False
+    year = int(match.group(1) or default_year)
+    hour_text = match.group(4)
+    minute_text = match.group(5)
+    explicit_time = hour_text is not None
+    hour = int(hour_text) if explicit_time else (23 if deadline else 0)
+    minute = int(minute_text or 0) if explicit_time else (59 if deadline else 0)
+    try:
+        return datetime(year, int(match.group(2)), int(match.group(3)), hour, minute), explicit_time
+    except ValueError:
+        return None, False
+
+
+def extract_first_link(text: str) -> str:
+    match = re.search(r"https?://[^\s，。；;）)]+", text, re.I)
+    if match:
+        return match.group(0)
+    match = re.search(r"(?<![@\w])(?:[a-z0-9-]+\.)+(?:gov\.cn|com\.cn|com|cn)(?:/[^\s，。；;）)]*)?", text, re.I)
+    return "https://" + match.group(0) if match else ""
+
+
+def extract_smart_events(text: str, title_prefix: str = "") -> list[dict[str, Any]]:
+    """Parse common Chinese recruitment/exam time nodes locally with deterministic rules."""
+    clean = normalize_chinese_text(text)
+    explicit_year = re.search(r"(20\d{2})年", clean)
+    base_year = int(explicit_year.group(1)) if explicit_year else datetime.now().year
+    title_prefix = title_prefix.strip().strip("·-— ")
+    link = extract_first_link(clean)
+    candidates: list[dict[str, Any]] = []
+
+    def title_for(label: str) -> str:
+        return f"{title_prefix} · {label}" if title_prefix else label
+
+    def add_candidate(
+        event_type: str,
+        label: str,
+        start: datetime,
+        deadline: datetime | None = None,
+        all_day: bool = True,
+        confidence: int = 1,
+    ) -> None:
+        due = deadline or start
+        delta = due - datetime.now()
+        candidates.append({
+            "title": title_for(label),
+            "type": event_type if event_type in EVENT_TYPES else "其他",
+            "start_at": dt_to_text(start),
+            "deadline_at": dt_to_text(deadline),
+            "all_day": all_day,
+            "location": "线上" if event_type in ("报名开始", "报名截止", "缴费截止", "网申截止", "简历投递截止", "准考证打印") else "",
+            "link": link,
+            "notes": "[智能识别导入]\n" + text.strip(),
+            "priority": "高" if timedelta(0) <= delta < timedelta(days=7) else "普通",
+            "status": "待办",
+            "important": timedelta(0) <= delta < timedelta(days=30),
+            "confidence": confidence,
+        })
+
+    deadline_specs = (
+        ("报名截止", "报名截止", r"报名(?:的)?(?:截止时间|截止日期|截止)"),
+        ("缴费截止", "缴费截止", r"缴费(?:的)?(?:截止时间|截止日期|截止)"),
+        ("网申截止", "网申截止", r"网申(?:的)?(?:截止时间|截止日期|截止)"),
+        ("简历投递截止", "简历投递截止", r"简历投递(?:的)?(?:截止时间|截止日期|截止)"),
+        ("笔试确认", "笔试确认截止", r"笔试确认(?:的)?(?:截止时间|截止日期|截止)"),
+    )
+    for event_type, label, keyword in deadline_specs:
+        pattern = re.compile(rf"{keyword}\s*(?:为|是|:)?\s*(?P<date>{DATE_TOKEN})")
+        for match in pattern.finditer(clean):
+            value, has_time = parse_chinese_datetime(match.group("date"), base_year, deadline=True)
+            if value:
+                add_candidate(event_type, label, value, value, not has_time, 3)
+
+    timed_specs = (
+        ("笔试", "笔试", r"(?:笔试|素质测试)"),
+        ("面试", "面试", r"面试"),
+        ("资格复审", "资格复审", r"资格复审"),
+        ("体检", "体检", r"体检"),
+        ("政审", "政审", r"政审"),
+    )
+    for event_type, label, keyword in timed_specs:
+        pattern = re.compile(rf"{keyword}[^。；;\n]{{0,60}}?(?:时间|日期)\s*(?:为|是|:)?\s*(?P<date>{DATE_TOKEN})")
+        for match in pattern.finditer(clean):
+            value, has_time = parse_chinese_datetime(match.group("date"), base_year)
+            if value:
+                add_candidate(event_type, label, value, None, not has_time, 3)
+
+    range_pattern = re.compile(
+        rf"(?P<prefix>[^。；;\n]{{0,55}}?)(?P<start>{DATE_TOKEN})\s*(?:至|到|-)\s*(?P<end>{DATE_TOKEN})(?P<suffix>[^。；;\n]{{0,55}})"
+    )
+    for match in range_pattern.finditer(clean):
+        context = match.group("prefix") + match.group("suffix")
+        start, start_has_time = parse_chinese_datetime(match.group("start"), base_year)
+        if not start:
+            continue
+        end, end_has_time = parse_chinese_datetime(match.group("end"), start.year, deadline=True)
+        if not end:
+            continue
+        if end < start and "年" not in match.group("end"):
+            try:
+                end = end.replace(year=end.year + 1)
+            except ValueError:
+                continue
+        if "准考证" in context or "打印" in context:
+            add_candidate("准考证打印", "准考证打印", start, end, not (start_has_time or end_has_time), 2)
+        elif any(word in context for word in ("报名", "报考", "填报", "登录")):
+            add_candidate("报名开始", "报名开始", start, None, not start_has_time, 2)
+            add_candidate("报名截止", "报名截止", end, end, not end_has_time, 1)
+        elif "缴费" in context:
+            add_candidate("缴费截止", "缴费截止", end, end, not end_has_time, 1)
+
+    start_pattern = re.compile(rf"(?:报名|网申|填报)[^。；;\n]{{0,25}}?(?:开始时间|开始日期|自)\s*(?:为|是|:)?\s*(?P<date>{DATE_TOKEN})")
+    for match in start_pattern.finditer(clean):
+        value, has_time = parse_chinese_datetime(match.group("date"), base_year)
+        if value:
+            add_candidate("报名开始", "报名开始", value, None, not has_time, 3)
+
+    # Keep the most precise result for the same kind of node on the same day.
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in candidates:
+        due_text = item.get("deadline_at") or item["start_at"]
+        key = (item["type"], due_text[:10])
+        previous = merged.get(key)
+        if previous is None or item["confidence"] > previous["confidence"]:
+            merged[key] = item
+    result = sorted(merged.values(), key=lambda item: item["start_at"])
+    for item in result:
+        item.pop("confidence", None)
+    return result
 
 
 class Settings:
@@ -362,6 +551,137 @@ class Database:
         return count
 
 
+class SmartImportDialog(QDialog):
+    imported = Signal(int)
+
+    def __init__(self, db: Database, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.events: list[dict[str, Any]] = []
+        self.setWindowTitle("智能识别时间节点")
+        self.resize(980, 680)
+        self.setMinimumSize(760, 560)
+        self.build_ui()
+
+    def build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        intro = QLabel("粘贴公告或招聘信息，程序会在本机识别报名、缴费、准考证、笔试、面试等时间节点。内容不会上传。")
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        prefix_row = QHBoxLayout()
+        prefix_row.addWidget(QLabel("事项名称前缀（可选）"))
+        self.prefix_edit = QLineEdit()
+        self.prefix_edit.setPlaceholderText("例如：江苏省选调生；识别结果会显示为“江苏省选调生 · 报名截止”")
+        prefix_row.addWidget(self.prefix_edit, 1)
+        root.addLayout(prefix_row)
+
+        self.source_edit = QTextEdit()
+        self.source_edit.setPlaceholderText("请粘贴包含日期的公告正文……")
+        self.source_edit.setMinimumHeight(175)
+        root.addWidget(self.source_edit)
+
+        action_row = QHBoxLayout()
+        recognize = QPushButton("识别时间节点")
+        recognize.setObjectName("primaryButton")
+        recognize.clicked.connect(self.recognize)
+        clear = QPushButton("清空")
+        clear.clicked.connect(lambda: (self.source_edit.clear(), self.table.setRowCount(0)))
+        self.reminder_enabled = QCheckBox("导入后启用提醒（提前1天、2小时）")
+        self.reminder_enabled.setChecked(True)
+        action_row.addWidget(recognize)
+        action_row.addWidget(clear)
+        action_row.addStretch()
+        action_row.addWidget(self.reminder_enabled)
+        root.addLayout(action_row)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["导入", "类型", "标题", "开始时间", "截止时间", "全天"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        root.addWidget(self.table, 1)
+
+        hint = QLabel("识别结果可直接双击修改。请核对标题和时间后再导入；无法明确判断的日期不会自动写入。")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("导入勾选事项")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self.import_selected)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self.source_edit.setFocus()
+
+    def recognize(self) -> None:
+        source = self.source_edit.toPlainText().strip()
+        if not source:
+            QMessageBox.warning(self, "没有内容", "请先粘贴需要识别的公告或招聘信息。")
+            return
+        self.events = extract_smart_events(source, self.prefix_edit.text())
+        self.table.setRowCount(0)
+        for event in self.events:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            checked = QTableWidgetItem()
+            checked.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+            checked.setCheckState(Qt.Checked)
+            self.table.setItem(row, 0, checked)
+            values = [
+                event["type"], event["title"], event["start_at"][:16],
+                (event.get("deadline_at") or "")[:16], "是" if event.get("all_day") else "否",
+            ]
+            for col, value in enumerate(values, 1):
+                self.table.setItem(row, col, QTableWidgetItem(value))
+        if not self.events:
+            QMessageBox.information(self, "未识别到节点", "没有找到足够明确的时间节点。请保留“报名截止、缴费截止、笔试时间”等关键词后重试。")
+
+    def import_selected(self) -> None:
+        if not self.events or self.table.rowCount() == 0:
+            QMessageBox.warning(self, "没有识别结果", "请先点击“识别时间节点”。")
+            return
+        selected: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for row in range(self.table.rowCount()):
+            check = self.table.item(row, 0)
+            if not check or check.checkState() != Qt.Checked:
+                continue
+            event = dict(self.events[row])
+            event_type = (self.table.item(row, 1).text() if self.table.item(row, 1) else "其他").strip()
+            event["type"] = event_type if event_type in EVENT_TYPES else "其他"
+            event["title"] = (self.table.item(row, 2).text() if self.table.item(row, 2) else "").strip()
+            start_text = (self.table.item(row, 3).text() if self.table.item(row, 3) else "").strip()
+            deadline_text = (self.table.item(row, 4).text() if self.table.item(row, 4) else "").strip()
+            start = text_to_dt(start_text)
+            deadline = text_to_dt(deadline_text) if deadline_text else None
+            if not event["title"] or not start or (deadline_text and not deadline):
+                errors.append(str(row + 1))
+                continue
+            event["start_at"] = dt_to_text(start)
+            event["deadline_at"] = dt_to_text(deadline)
+            all_day_text = (self.table.item(row, 5).text() if self.table.item(row, 5) else "否").strip().lower()
+            event["all_day"] = all_day_text in ("是", "true", "1", "yes", "全天")
+            event["reminder_enabled"] = self.reminder_enabled.isChecked()
+            event["reminder_offsets"] = [1440, 120] if self.reminder_enabled.isChecked() else []
+            selected.append(event)
+        if errors:
+            QMessageBox.warning(self, "内容有误", f"第 {', '.join(errors)} 行的标题或时间格式不正确，请使用 yyyy-MM-dd HH:mm 格式。")
+            return
+        if not selected:
+            QMessageBox.warning(self, "没有勾选", "请至少勾选一条要导入的事项。")
+            return
+        for event in selected:
+            self.db.save_event(event)
+        self.imported.emit(len(selected))
+        QMessageBox.information(self, "导入完成", f"已添加 {len(selected)} 条事项。")
+        self.accept()
+
+
 class EventDialog(QDialog):
     saved = Signal()
 
@@ -494,9 +814,14 @@ class EventChip(QFrame):
             f"QFrame#eventChip{{border-left:3px solid {color};"
             f"background:rgba({rgb.red()},{rgb.green()},{rgb.blue()},26);border-radius:5px;}}"
         )
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
         row = QHBoxLayout(self); row.setContentsMargins(5, 3, 3, 3); row.setSpacing(4)
         done = QCheckBox(); done.setChecked(event.get("status") == "已完成"); done.setToolTip("标记完成")
         done.toggled.connect(self.toggle_done); row.addWidget(done)
+        action_width = round(32 * max(1.0, min(1.35, getattr(QApplication.instance(), "current_font_pt", 12) / 12)))
+        edit = QToolButton(); edit.setObjectName("eventAction"); edit.setFixedWidth(action_width); edit.setText("✎"); edit.setToolTip("编辑"); edit.clicked.connect(self.edit_event); row.addWidget(edit)
+        delete = QToolButton(); delete.setObjectName("eventAction"); delete.setFixedWidth(action_width); delete.setText("×"); delete.setToolTip("删除"); delete.clicked.connect(self.delete_event); row.addWidget(delete)
         title = event["title"]
         if not compact:
             due = text_to_dt(event.get("deadline_at") or event.get("start_at"))
@@ -504,11 +829,16 @@ class EventChip(QFrame):
                 short_date = due.strftime("%m/%d" if event.get("all_day") else "%m/%d %H:%M")
                 title = f"{short_date} · {title}"
         label = QLabel(title); label.setTextInteractionFlags(Qt.TextSelectableByMouse); label.setToolTip(self.tooltip_text()); label.setWordWrap(not compact)
+        label.setContextMenuPolicy(Qt.CustomContextMenu)
+        label.customContextMenuRequested.connect(lambda point, source=label: self.show_context_menu(source.mapTo(self, point)))
+        if compact:
+            label.setMinimumWidth(label.fontMetrics().horizontalAdvance(title) + 12)
+            label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        else:
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         if event.get("status") == "已完成": label.setStyleSheet("text-decoration:line-through;color:#7b8794;")
         row.addWidget(label, 1)
-        action_width = round(32 * max(1.0, min(1.35, getattr(QApplication.instance(), "current_font_pt", 12) / 12)))
-        edit = QToolButton(); edit.setObjectName("eventAction"); edit.setFixedWidth(action_width); edit.setText("✎"); edit.setToolTip("编辑"); edit.clicked.connect(self.edit_event); row.addWidget(edit)
-        delete = QToolButton(); delete.setObjectName("eventAction"); delete.setFixedWidth(action_width); delete.setText("×"); delete.setToolTip("删除"); delete.clicked.connect(self.delete_event); row.addWidget(delete)
 
     def tooltip_text(self) -> str:
         e = self.event
@@ -523,6 +853,16 @@ class EventChip(QFrame):
     def edit_event(self) -> None:
         dlg = EventDialog(self.db, self.db.get_event(self.event["id"]), parent=self.window())
         dlg.saved.connect(self.changed); dlg.exec()
+
+    def show_context_menu(self, point: QPoint) -> None:
+        menu = QMenu(self)
+        edit_action = menu.addAction("编辑事项")
+        delete_action = menu.addAction("删除事项")
+        chosen = menu.exec(self.mapToGlobal(point))
+        if chosen == edit_action:
+            self.edit_event()
+        elif chosen == delete_action:
+            self.delete_event()
 
     def delete_event(self) -> None:
         if QMessageBox.question(self.window(), "删除事项", f"确定删除“{self.event['title']}”吗？") == QMessageBox.Yes:
@@ -545,9 +885,10 @@ class DayCell(QFrame):
         top = QHBoxLayout(); number = QLabel(str(date.day())); number.setStyleSheet("font-weight:700;color:#2563eb;" if today else ("color:#9aa4b2;" if other else "font-weight:600;"))
         add = QToolButton(); add.setText("＋"); add.setToolTip("添加事项"); add.clicked.connect(lambda: self.add_requested.emit(self.date))
         top.addWidget(number); top.addStretch(); top.addWidget(add); layout.addLayout(top)
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame); scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded); scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setStyleSheet("QScrollArea{background:transparent;border:0;}QScrollArea>QWidget>QWidget{background:transparent;}")
-        content = QWidget(); content.setStyleSheet("background:transparent;"); v = QVBoxLayout(content); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(3)
+        content = QWidget(); content.setStyleSheet("background:transparent;"); v = QVBoxLayout(content); v.setSizeConstraint(QLayout.SetMinimumSize); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(3)
         for event in events:
             chip = EventChip(self.window().db if hasattr(self.window(), "db") else parent.db, event, True)
             chip.changed.connect(self.changed); v.addWidget(chip)
@@ -630,10 +971,15 @@ class WeekView(QWidget):
         for i in range(7):
             date = self.week_start.addDays(i); key = date.toString("yyyy-MM-dd")
             group = QGroupBox(f"{'一二三四五六日'[i]}\n{date.toString('M/d')}"); v = QVBoxLayout(group)
+            scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded); scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            content = QWidget(); event_layout = QVBoxLayout(content); event_layout.setSizeConstraint(QLayout.SetMinimumSize)
+            event_layout.setContentsMargins(0, 0, 0, 0); event_layout.setSpacing(4)
             matches = [e for e in events if key in ((e.get("start_at") or "")[:10], (e.get("deadline_at") or "")[:10])]
             for event in matches:
-                chip = EventChip(self.db, event, True); chip.changed.connect(self.changed); v.addWidget(chip)
-            add = QPushButton("＋ 添加"); add.clicked.connect(lambda _, d=date: self.add_event(d)); v.addWidget(add); v.addStretch(); self.days.addWidget(group, 1)
+                chip = EventChip(self.db, event, True); chip.changed.connect(self.changed); event_layout.addWidget(chip)
+            event_layout.addStretch(); scroll.setWidget(content); v.addWidget(scroll, 1)
+            add = QPushButton("＋ 添加"); add.clicked.connect(lambda _, d=date: self.add_event(d)); v.addWidget(add); self.days.addWidget(group, 1)
 
     def add_event(self, date: QDate) -> None:
         dlg = EventDialog(self.db, default_date=date, parent=self.window()); dlg.saved.connect(self.changed); dlg.exec()
@@ -651,6 +997,7 @@ class AgendaView(QWidget):
         self.table = QTableWidget(0, 7); self.table.setHorizontalHeaderLabels(["完成", "日期", "标题", "类型", "优先级", "状态", "倒计时"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows); self.table.setEditTriggers(QAbstractItemView.NoEditTriggers); self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch); self.table.doubleClicked.connect(self.edit_selected)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self.show_context_menu)
         root.addWidget(self.table); self.refresh()
 
     def refresh(self, events: list[dict[str, Any]] | None = None) -> None:
@@ -671,6 +1018,23 @@ class AgendaView(QWidget):
         row = self.table.currentRow(); item = self.table.item(row, 1) if row >= 0 else None
         if not item: return
         event = self.db.get_event(item.data(Qt.UserRole)); dlg = EventDialog(self.db, event, parent=self.window()); dlg.saved.connect(self.changed); dlg.exec()
+
+    def show_context_menu(self, point: QPoint) -> None:
+        row = self.table.rowAt(point.y())
+        if row < 0:
+            return
+        self.table.selectRow(row)
+        menu = QMenu(self)
+        edit_action = menu.addAction("编辑事项")
+        delete_action = menu.addAction("删除事项")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(point))
+        if chosen == edit_action:
+            self.edit_selected()
+        elif chosen == delete_action:
+            item = self.table.item(row, 1)
+            event = self.db.get_event(item.data(Qt.UserRole)) if item else None
+            if event and QMessageBox.question(self, "删除事项", f"确定删除“{event['title']}”吗？") == QMessageBox.Yes:
+                self.db.delete_event(event["id"]); self.changed.emit()
 
 
 class DashboardPanel(QScrollArea):
@@ -863,6 +1227,7 @@ class MainWindow(QMainWindow):
     def __init__(self, db: Database, settings: Settings):
         super().__init__(); self.db = db; self.settings = settings; self.allow_close = False
         self.font_resize_timer = QTimer(self); self.font_resize_timer.setSingleShot(True); self.font_resize_timer.setInterval(180); self.font_resize_timer.timeout.connect(self.apply_auto_font)
+        self.splitter_save_timer = QTimer(self); self.splitter_save_timer.setSingleShot(True); self.splitter_save_timer.setInterval(300); self.splitter_save_timer.timeout.connect(self.save_splitter_sizes)
         self.setWindowTitle(APP_NAME); self.resize(1420, 860); self.setMinimumSize(1050, 680)
         self.build_ui(); self.refresh_all(); self.auto_backup()
 
@@ -871,6 +1236,7 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout(); logo = QLabel(APP_NAME); logo.setObjectName("appLogo")
         self.search = QLineEdit(); self.search.setPlaceholderText("搜索标题、地点、备注……"); self.search.setClearButtonEnabled(True); self.search.setMinimumWidth(260); self.search.textChanged.connect(self.refresh_all)
         add = QPushButton("＋ 新建事项"); add.setObjectName("primaryButton"); add.clicked.connect(self.add_event)
+        smart = QPushButton("智能识别"); smart.setToolTip("粘贴公告文字，自动提取报名、缴费、准考证、笔试等时间节点"); smart.clicked.connect(self.smart_import)
         widget_btn = QPushButton("桌面小组件"); widget_btn.clicked.connect(self.show_widget)
         data_btn = QPushButton("数据与备份 ▾"); menu = QMenu(data_btn)
         for text, fn in (("导出 JSON", self.export_json), ("导入 JSON", self.import_json), ("导出 CSV", self.export_csv), ("导出 ICS", self.export_ics), ("立即备份数据库", self.backup_now), ("从数据库备份恢复", self.restore_backup), ("打开数据文件夹", self.open_data_folder)):
@@ -879,9 +1245,9 @@ class MainWindow(QMainWindow):
         font_smaller = QToolButton(); font_smaller.setText("A−"); font_smaller.setToolTip("减小文字（切换为自定义字号）"); font_smaller.clicked.connect(lambda: self.adjust_font(-1))
         font_larger = QToolButton(); font_larger.setText("A＋"); font_larger.setToolTip("增大文字（切换为自定义字号）"); font_larger.clicked.connect(lambda: self.adjust_font(1))
         settings_btn = QPushButton("设置"); settings_btn.clicked.connect(self.open_settings)
-        toolbar.addWidget(logo); toolbar.addStretch(); toolbar.addWidget(self.search); toolbar.addWidget(add); toolbar.addWidget(widget_btn); toolbar.addWidget(data_btn); toolbar.addWidget(font_smaller); toolbar.addWidget(font_larger); toolbar.addWidget(settings_btn); root.addLayout(toolbar)
+        toolbar.addWidget(logo); toolbar.addStretch(); toolbar.addWidget(self.search); toolbar.addWidget(add); toolbar.addWidget(smart); toolbar.addWidget(widget_btn); toolbar.addWidget(data_btn); toolbar.addWidget(font_smaller); toolbar.addWidget(font_larger); toolbar.addWidget(settings_btn); root.addLayout(toolbar)
 
-        splitter = QSplitter(Qt.Horizontal); root.addWidget(splitter, 1)
+        splitter = QSplitter(Qt.Horizontal); self.splitter = splitter; splitter.setChildrenCollapsible(False); splitter.setHandleWidth(8); root.addWidget(splitter, 1)
         sidebar = QFrame(); self.sidebar = sidebar; sidebar.setMinimumWidth(165); sidebar.setMaximumWidth(220); side = QVBoxLayout(sidebar); side.setContentsMargins(0,0,8,0)
         side.addWidget(QLabel("事件类型")); self.type_filter = QListWidget(); self.type_filter.addItem("全部类型"); self.type_filter.addItems(EVENT_TYPES.keys()); self.type_filter.setCurrentRow(0); self.type_filter.currentRowChanged.connect(self.refresh_all); side.addWidget(self.type_filter, 1)
         side.addWidget(QLabel("状态")); self.status_filter = QComboBox(); self.status_filter.addItems(["全部状态"] + STATUSES + ["已逾期"]); self.status_filter.currentTextChanged.connect(self.refresh_all); side.addWidget(self.status_filter)
@@ -889,7 +1255,10 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget(); self.month_view = MonthView(self.db, self); self.week_view = WeekView(self.db, self); self.agenda_view = AgendaView(self.db, self)
         self.tabs.addTab(self.month_view, "月视图"); self.tabs.addTab(self.week_view, "周视图"); self.tabs.addTab(self.agenda_view, "议程视图"); splitter.addWidget(self.tabs)
-        self.dashboard = DashboardPanel(self.db, self); self.dashboard.setMinimumWidth(315); self.dashboard.setMaximumWidth(400); splitter.addWidget(self.dashboard); splitter.setStretchFactor(1, 1); splitter.setSizes([180, 900, 340])
+        self.dashboard = DashboardPanel(self.db, self); self.dashboard.setMinimumWidth(240); splitter.addWidget(self.dashboard); splitter.setStretchFactor(1, 1)
+        saved_sizes = self.settings.get("main_splitter_sizes", [180, 900, 340])
+        splitter.setSizes(saved_sizes if isinstance(saved_sizes, list) and len(saved_sizes) == 3 else [180, 900, 340])
+        splitter.splitterMoved.connect(lambda *_: self.splitter_save_timer.start())
         for source in (self.month_view, self.week_view, self.agenda_view, self.dashboard): source.changed.connect(self.refresh_all)
         self.statusBar().showMessage(f"本地数据：{DB_PATH}")
 
@@ -916,6 +1285,15 @@ class MainWindow(QMainWindow):
 
     def add_event(self) -> None:
         dlg = EventDialog(self.db, parent=self); dlg.saved.connect(self.refresh_all); dlg.exec()
+
+    def smart_import(self) -> None:
+        dlg = SmartImportDialog(self.db, self)
+        dlg.imported.connect(lambda count: self.refresh_all())
+        dlg.exec()
+
+    def save_splitter_sizes(self) -> None:
+        if hasattr(self, "splitter"):
+            self.settings.set("main_splitter_sizes", self.splitter.sizes())
 
     def show_widget(self) -> None:
         self.desktop_widget.show(); self.desktop_widget.raise_(); self.desktop_widget.activateWindow(); self.settings.set("widget_visible", True)
@@ -952,7 +1330,7 @@ class MainWindow(QMainWindow):
     def update_font_geometry(self, font_pt: int) -> None:
         scale = max(0.9, min(1.6, font_pt / 12))
         self.sidebar.setMinimumWidth(round(180 * scale)); self.sidebar.setMaximumWidth(round(235 * scale))
-        self.dashboard.setMinimumWidth(round(315 * scale)); self.dashboard.setMaximumWidth(round(420 * scale))
+        self.dashboard.setMinimumWidth(round(240 * scale)); self.dashboard.setMaximumWidth(16777215)
         self.search.setMinimumWidth(round(260 * scale))
 
     def apply_auto_font(self) -> None:
@@ -1027,6 +1405,7 @@ class MainWindow(QMainWindow):
     def open_data_folder(self) -> None: QDesktopServices.openUrl(Path(APP_DIR).as_uri())
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.save_splitter_sizes()
         if self.allow_close: event.accept()
         else: event.ignore(); self.hide(); self.tray.showMessage(APP_NAME, "程序仍在后台运行，可从系统托盘重新打开。", QSystemTrayIcon.Information, 2500)
 
